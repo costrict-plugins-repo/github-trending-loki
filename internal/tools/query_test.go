@@ -1,0 +1,186 @@
+package tools_test
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/cockroachdb/errors"
+	"github.com/lexfrei/mcp-loki/internal/loki"
+	"github.com/lexfrei/mcp-loki/internal/tools"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+)
+
+func TestQueryHandler_Success(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		resp := loki.QueryResponse{
+			Status: statusSuccess,
+			Data: loki.QueryData{
+				ResultType: resultTypeValue,
+				Result: []loki.StreamResult{
+					{
+						Stream: map[string]string{argApp: "test"},
+						Values: [][]json.RawMessage{
+							{json.RawMessage(`"1609459200000000000"`), json.RawMessage(`"test log line"`)},
+						},
+					},
+				},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+
+		err := json.NewEncoder(w).Encode(resp)
+		if err != nil {
+			t.Fatalf("failed to encode response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	client := loki.NewClient(server.URL, "", "", "", "")
+	handler := tools.NewQueryHandler(client)
+
+	params := tools.QueryParams{
+		Query: selectorTest,
+	}
+
+	result, _, err := handler(context.Background(), &mcp.CallToolRequest{}, params)
+	if err != nil {
+		t.Fatalf("handler failed: %v", err)
+	}
+
+	if result != nil && result.IsError {
+		t.Errorf("expected success, got error")
+	}
+}
+
+func TestQueryHandler_WithTimeRange(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := r.URL.Query().Get("start")
+		end := r.URL.Query().Get("end")
+
+		if start == "" || end == "" {
+			t.Error("expected start and end parameters")
+		}
+
+		resp := loki.QueryResponse{
+			Status: statusSuccess,
+			Data:   loki.QueryData{ResultType: resultTypeValue, Result: []loki.StreamResult{}},
+		}
+		w.Header().Set("Content-Type", "application/json")
+
+		err := json.NewEncoder(w).Encode(resp)
+		if err != nil {
+			t.Fatalf("failed to encode response: %v", err)
+		}
+	}))
+	defer server.Close()
+
+	client := loki.NewClient(server.URL, "", "", "", "")
+	handler := tools.NewQueryHandler(client)
+
+	params := tools.QueryParams{
+		Query: selectorTest,
+		Start: timerange1h,
+		End:   timeNow,
+	}
+
+	_, _, err := handler(context.Background(), &mcp.CallToolRequest{}, params)
+	if err != nil {
+		t.Fatalf("handler failed: %v", err)
+	}
+}
+
+func TestQueryHandler_RelativeTime(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		valid bool
+	}{
+		{"hours", timerange1h, true},
+		{"minutes", timerange30m, true},
+		{"days", "7d", true},
+		{timeNow, timeNow, true},
+		{"rfc3339", timeRFC3339Sample, true},
+		{errorTypeData, errorTypeData, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := tools.ParseTime(tt.input)
+			if tt.valid && err != nil {
+				t.Errorf("expected valid time, got error: %v", err)
+			}
+
+			if !tt.valid && err == nil {
+				t.Error("expected error, got nil")
+			}
+		})
+	}
+}
+
+func TestQueryHandler_MissingQuery(t *testing.T) {
+	client := loki.NewClient("http://localhost:3100", "", "", "", "")
+	handler := tools.NewQueryHandler(client)
+
+	params := tools.QueryParams{
+		Query: "",
+	}
+
+	result, _, err := handler(context.Background(), &mcp.CallToolRequest{}, params)
+	if err == nil {
+		t.Error("expected error for missing query")
+	}
+
+	if result != nil {
+		t.Error("expected nil CallToolResult on error path")
+	}
+
+	if !errors.Is(err, tools.ErrValidation) {
+		t.Errorf("expected ErrValidation, got: %v", err)
+	}
+}
+
+func TestQueryHandler_InvalidStartTime(t *testing.T) {
+	client := loki.NewClient("http://localhost:3100", "", "", "", "")
+	handler := tools.NewQueryHandler(client)
+
+	params := tools.QueryParams{
+		Query: selectorTest,
+		Start: timeNotParsable,
+	}
+
+	_, _, err := handler(context.Background(), &mcp.CallToolRequest{}, params)
+	if err == nil {
+		t.Fatal("expected error for invalid start time")
+	}
+
+	if !errors.Is(err, tools.ErrValidation) {
+		t.Errorf("expected ErrValidation, got: %v", err)
+	}
+}
+
+func TestQueryHandler_LokiError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"status":"error","error":"internal"}`))
+	}))
+	defer srv.Close()
+
+	client := loki.NewClient(srv.URL, "", "", "", "")
+	handler := tools.NewQueryHandler(client)
+
+	params := tools.QueryParams{
+		Query: selectorTest,
+	}
+
+	_, _, err := handler(context.Background(), &mcp.CallToolRequest{}, params)
+	if err == nil {
+		t.Fatal("expected error for Loki failure")
+	}
+
+	if !errors.Is(err, tools.ErrLokiRequest) {
+		t.Errorf("expected ErrLokiRequest, got: %v", err)
+	}
+}
